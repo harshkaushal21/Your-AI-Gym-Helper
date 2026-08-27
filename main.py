@@ -197,51 +197,90 @@ def main():
 
 
 # =====================================================
-# STABLE WEBCAM SECTION
+# Isolated, auto-refreshing fragment for the webcam/video
+# section. This owns BOTH the webrtc_streamer() call and
+# sync_metrics_update(context) -- the function that pulls
+# the latest rep-count / angle data OUT of the video
+# processor thread and into st.session_state.
 #
-# IMPORTANT:
-# Do NOT put webrtc_streamer() inside an auto-refreshing
-# fragment. The old version called webrtc_streamer() every
-# 2 seconds. On Streamlit Cloud this can race with the
-# WebRTC/ICE connection closing and cause:
+# Without this running on a timer, sync_metrics_update()
+# only ever fires once (on initial page load), so reps
+# never increase even though the camera itself is smooth.
 #
-#   AttributeError: 'NoneType' object has no attribute
-#   'sendto'
-#
-# The webcam component is now rendered ONCE per normal
-# Streamlit run. The live-metrics fragment only reads the
-# already-running WebRTC context.
+# webrtc_streamer() uses a fixed key ("exercise-analysis"),
+# so re-invoking it on every fragment tick just reconnects
+# to the same underlying camera session -- it does NOT
+# restart the camera or re-init the video processor.
 # =====================================================
 
-def render_video_fragment():
+def get_ice_servers():
+    """
+    Get ICE servers for WebRTC.
+    Uses Twilio TURN when credentials are configured.
+    Falls back to Google STUN for local/basic environments.
+    """
+    try:
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
+        auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
+        if not account_sid and hasattr(st, "secrets"):
+            account_sid = st.secrets.get("TWILIO_ACCOUNT_SID", "")
+
+        if not auth_token and hasattr(st, "secrets"):
+            auth_token = st.secrets.get("TWILIO_AUTH_TOKEN", "")
+
+        if account_sid and auth_token:
+            from twilio.rest import Client
+
+            client = Client(account_sid, auth_token)
+            token = client.tokens.create()
+            return token.ice_servers
+
+    except Exception:
+        pass
+
+    return [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+    ]
+
+
+def render_video_fragment():
+    """
+    IMPORTANT:
+    This function is intentionally NOT a timed fragment.
+
+    Re-running webrtc_streamer every few seconds can interrupt the
+    WebRTC session. The camera component is therefore created once
+    per Streamlit script run, while the separate metrics fragment
+    refreshes the UI.
+    """
     context = webrtc_streamer(
         key="exercise-analysis",
-        # We only receive the webcam from the browser.
-        # SENDONLY avoids an unnecessary return media track.
         mode=WebRtcMode.SENDONLY,
         video_processor_factory=VideoProcessorClass,
-        rtc_configuration={
-            "iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]},
-                {"urls": ["stun:stun1.l.google.com:19302"]},
-                {"urls": ["stun:stun.cloudflare.com:3478"]},
-            ]
+
+        frontend_rtc_configuration={
+            "iceServers": get_ice_servers()
         },
+
+        server_rtc_configuration={
+            "iceServers": get_ice_servers()
+        },
+
         media_stream_constraints={
-            # Lower capture load = much less CPU/network pressure.
             "video": {
-                "width": {"ideal": 320, "max": 480},
-                "height": {"ideal": 240, "max": 360},
+                "width": {"ideal": 320, "max": 640},
+                "height": {"ideal": 240, "max": 480},
                 "frameRate": {"ideal": 10, "max": 15},
             },
             "audio": False,
         },
+
         async_processing=True,
     )
 
-    # Keep the live WebRTC context available to the metrics
-    # fragment without re-creating the camera connection.
+    # Keep the WebRTC context available to the timed metrics fragment.
     st.session_state["webrtc_context"] = context
 
     inject_webrtc_styles()
@@ -250,23 +289,23 @@ def render_video_fragment():
 # =====================================================
 # Isolated, auto-refreshing fragment for live metrics.
 #
-# Only this block refreshes. It syncs metrics from the
-# already-running WebRTC processor instead of calling
-# webrtc_streamer() again.
+# st.fragment(run_every=...) reruns ONLY this function on
+# a timer -- not the whole script. This replaces the old
+# "time.sleep(0.25); st.rerun()" pattern, which forced a
+# full-page reload (including re-mounting the webcam
+# component) multiple times per second and was the single
+# biggest source of overall app slowness.
 # =====================================================
 
 @st.fragment(run_every=2.0)
 def render_live_metrics_fragment():
 
-    # Pull the latest data from the SAME WebRTC session.
-    # Never recreate/reconnect the camera from this timer.
+    # Sync the latest metrics without recreating the WebRTC component.
     context = st.session_state.get("webrtc_context")
     if context is not None:
         try:
             sync_metrics_update(context)
         except Exception:
-            # A browser/network disconnect should not crash
-            # the Streamlit page or trigger another reconnect.
             pass
 
     exercise = st.session_state.get("exercise_type")
