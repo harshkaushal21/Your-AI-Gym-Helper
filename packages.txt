@@ -4,3 +4,4 @@ libsm6
 libxext6
 libgles2-mesa
 libxrender1
+libgomp1
