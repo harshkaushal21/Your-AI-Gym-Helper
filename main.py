@@ -213,7 +213,7 @@ def main():
 # restart the camera or re-init the video processor.
 # =====================================================
 
-@st.fragment(run_every=0.5)
+@st.fragment(run_every=2.0)
 def render_video_fragment():
 
     context = webrtc_streamer(
@@ -272,7 +272,7 @@ def render_video_fragment():
 # biggest source of overall app slowness.
 # =====================================================
 
-@st.fragment(run_every=0.5)
+@st.fragment(run_every=2.0)
 def render_live_metrics_fragment():
 
     exercise = st.session_state.get("exercise_type")
