@@ -159,7 +159,7 @@ def main():
             unsafe_allow_html=True,
         )
     else:
-        render_video_fragment()
+        render_video_section()
 
     st.divider()
 
@@ -197,93 +197,89 @@ def main():
 
 
 # =====================================================
-# Isolated, auto-refreshing fragment for the webcam/video
-# section. This owns BOTH the webrtc_streamer() call and
-# sync_metrics_update(context) -- the function that pulls
-# the latest rep-count / angle data OUT of the video
-# processor thread and into st.session_state.
+# webrtc_streamer() lives here, OUTSIDE any @st.fragment
+# with run_every. This function is called once per normal
+# Streamlit script run (on Start Workout, and on any full
+# rerun) -- NOT on a fixed timer.
 #
-# Without this running on a timer, sync_metrics_update()
-# only ever fires once (on initial page load), so reps
-# never increase even though the camera itself is smooth.
+# IMPORTANT FIX: previously webrtc_streamer() was called
+# from inside a fragment with run_every=... . Every time
+# that fragment re-ran (every 0.5-2s), it re-invoked
+# webrtc_streamer() again. On networks where the ICE/TURN
+# handshake takes more than a couple of seconds to
+# complete, the fragment would tick again *before* the
+# connection finished negotiating, effectively restarting
+# the negotiation mid-flight. That is what was causing the
+# repeated "camera loads -> goes black -> disconnects"
+# loop and the asyncio/STUN "NoneType has no attribute
+# sendto" errors in the logs (those were just the old,
+# half-torn-down connection's retry timer firing after
+# teardown -- a symptom, not the cause).
 #
-# webrtc_streamer() uses a fixed key ("exercise-analysis"),
-# so re-invoking it on every fragment tick just reconnects
-# to the same underlying camera session -- it does NOT
-# restart the camera or re-init the video processor.
+# By calling webrtc_streamer() here (no run_every wrapping
+# it), the peer connection is established once and left
+# alone. Only the lightweight metrics-sync below is put on
+# a timer, since that's the part that actually needs to
+# repeat to pull rep-count / angle data out of the video
+# processor thread.
 # =====================================================
 
-def get_ice_servers():
-    """
-    Get ICE servers for WebRTC.
-    Uses Twilio TURN when credentials are configured.
-    Falls back to Google STUN for local/basic environments.
-    """
-    try:
-        account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
-        auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+def render_video_section():
 
-        if not account_sid and hasattr(st, "secrets"):
-            account_sid = st.secrets.get("TWILIO_ACCOUNT_SID", "")
-
-        if not auth_token and hasattr(st, "secrets"):
-            auth_token = st.secrets.get("TWILIO_AUTH_TOKEN", "")
-
-        if account_sid and auth_token:
-            from twilio.rest import Client
-
-            client = Client(account_sid, auth_token)
-            token = client.tokens.create()
-            return token.ice_servers
-
-    except Exception:
-        pass
-
-    return [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-    ]
-
-
-def render_video_fragment():
-    """
-    IMPORTANT:
-    This function is intentionally NOT a timed fragment.
-
-    Re-running webrtc_streamer every few seconds can interrupt the
-    WebRTC session. The camera component is therefore created once
-    per Streamlit script run, while the separate metrics fragment
-    refreshes the UI.
-    """
     context = webrtc_streamer(
         key="exercise-analysis",
-        mode=WebRtcMode.SENDONLY,
+        mode=WebRtcMode.SENDRECV,
         video_processor_factory=VideoProcessorClass,
-
-        frontend_rtc_configuration={
-            "iceServers": get_ice_servers()
+        rtc_configuration={
+            "iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]},
+                {
+                    "urls": ["turn:openrelay.metered.ca:80"],
+                    "username": "openrelayproject",
+                    "credential": "openrelayproject",
+                },
+                {
+                    "urls": ["turn:openrelay.metered.ca:443"],
+                    "username": "openrelayproject",
+                    "credential": "openrelayproject",
+                },
+                {
+                    "urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
+                    "username": "openrelayproject",
+                    "credential": "openrelayproject",
+                },
+            ]
         },
-
-        server_rtc_configuration={
-            "iceServers": get_ice_servers()
-        },
-
         media_stream_constraints={
+            # Cap the resolution/framerate the BROWSER captures
+            # at, before it ever reaches the server. Requesting
+            # unconstrained "video: True" lets the browser grab
+            # 720p/1080p by default, which is extra decode +
+            # network + resize cost on every single frame.
             "video": {
-                "width": {"ideal": 320, "max": 640},
-                "height": {"ideal": 240, "max": 480},
-                "frameRate": {"ideal": 10, "max": 15},
+                "width": {"ideal": 480},
+                "height": {"ideal": 360},
+                "frameRate": {"ideal": 15, "max": 20}
             },
-            "audio": False,
+            "audio": False
         },
-
-        async_processing=True,
+        async_processing=True
     )
 
-    # Keep the WebRTC context available to the timed metrics fragment.
-    st.session_state["webrtc_context"] = context
-
     inject_webrtc_styles()
+
+    # Only THIS part needs to repeat on a timer -- it just
+    # reads the latest metrics out of the already-running
+    # video processor thread. It does not touch/recreate
+    # the webrtc connection itself (context is passed in
+    # from the single webrtc_streamer() call above).
+    if context and context.state.playing:
+        sync_metrics_fragment(context)
+
+
+@st.fragment(run_every=1.0)
+def sync_metrics_fragment(context):
+    sync_metrics_update(context)
 
 
 # =====================================================
@@ -299,14 +295,6 @@ def render_video_fragment():
 
 @st.fragment(run_every=2.0)
 def render_live_metrics_fragment():
-
-    # Sync the latest metrics without recreating the WebRTC component.
-    context = st.session_state.get("webrtc_context")
-    if context is not None:
-        try:
-            sync_metrics_update(context)
-        except Exception:
-            pass
 
     exercise = st.session_state.get("exercise_type")
     total_reps = st.session_state.get("reps")
