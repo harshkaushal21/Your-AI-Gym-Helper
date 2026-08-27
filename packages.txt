@@ -5,3 +5,5 @@ libxext6
 libgles2-mesa
 libxrender1
 libgomp1
+libegl1
+libgl1-mesa-dri
